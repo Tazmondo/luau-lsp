@@ -312,6 +312,15 @@ void WorkspaceFolder::processNextWorkspaceDiagnostic(const LSPCancellationToken&
     pendingWorkspaceDiagnostics.pop_front();
     pendingWorkspaceDiagnosticsSet.erase(uri);
 
+    if (workspaceDiagnosticsProgressActive)
+    {
+        auto done = std::min(workspaceDiagnosticsProgressDone, workspaceDiagnosticsProgressTotal);
+        auto percentage = static_cast<uint8_t>(done * 100 / workspaceDiagnosticsProgressTotal);
+        client->sendWorkDoneProgressReport(workspaceDiagnosticsProgressToken(),
+            "(" + std::to_string(done) + "/" + std::to_string(workspaceDiagnosticsProgressTotal) + ") " + uri.lexicallyRelative(rootUri),
+            percentage);
+    }
+
     try
     {
         auto config = client->getConfiguration(rootUri);
@@ -344,9 +353,14 @@ void WorkspaceFolder::processAllWorkspaceDiagnostics()
 /// Only show progress for bulk re-checks. Re-checking the handful of dependents of an edited file should not flash a progress bar
 static constexpr size_t kMinFilesForWorkspaceDiagnosticsProgress = 20;
 
+std::string WorkspaceFolder::workspaceDiagnosticsProgressToken() const
+{
+    return "luau/workspaceDiagnostics/" + name;
+}
+
 void WorkspaceFolder::updateWorkspaceDiagnosticsProgress(size_t newlyQueued)
 {
-    const std::string token = "luau/workspaceDiagnostics/" + name;
+    const std::string token = workspaceDiagnosticsProgressToken();
 
     if (newlyQueued > 0)
     {
@@ -359,29 +373,17 @@ void WorkspaceFolder::updateWorkspaceDiagnosticsProgress(size_t newlyQueued)
             workspaceDiagnosticsProgressActive = true;
             workspaceDiagnosticsProgressTotal = pendingWorkspaceDiagnostics.size();
             workspaceDiagnosticsProgressDone = 0;
-            workspaceDiagnosticsProgressLastPercentage = 0;
             client->createWorkDoneProgress(token);
             client->sendWorkDoneProgressBegin(token, "Luau: Checking workspace", std::nullopt, 0);
         }
         return;
     }
 
-    if (!workspaceDiagnosticsProgressActive)
-        return;
-
-    if (pendingWorkspaceDiagnostics.empty())
+    // Per-file progress is reported as each file starts being checked (see processNextWorkspaceDiagnostic)
+    if (workspaceDiagnosticsProgressActive && pendingWorkspaceDiagnostics.empty())
     {
         workspaceDiagnosticsProgressActive = false;
         client->sendWorkDoneProgressEnd(token);
-        return;
-    }
-
-    auto done = std::min(workspaceDiagnosticsProgressDone, workspaceDiagnosticsProgressTotal);
-    auto percentage = static_cast<uint8_t>(done * 100 / workspaceDiagnosticsProgressTotal);
-    if (percentage != workspaceDiagnosticsProgressLastPercentage)
-    {
-        workspaceDiagnosticsProgressLastPercentage = percentage;
-        client->sendWorkDoneProgressReport(token, std::to_string(done) + "/" + std::to_string(workspaceDiagnosticsProgressTotal), percentage);
     }
 }
 

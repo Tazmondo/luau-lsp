@@ -155,6 +155,7 @@ private:
         const Uri& uri, const ClientConfiguration& config, const LSPCancellationToken& cancellationToken);
     bool canReportWorkspaceDiagnostics() const;
     void reportWorkspaceDocumentDiagnostics(const std::vector<lsp::WorkspaceDocumentDiagnosticReport>& reports);
+    std::string workspaceDiagnosticsProgressToken() const;
     void updateWorkspaceDiagnosticsProgress(size_t newlyQueued);
 
     /// Files waiting to have their workspace diagnostics computed in the background.
@@ -164,7 +165,6 @@ private:
     bool workspaceDiagnosticsProgressActive = false;
     size_t workspaceDiagnosticsProgressTotal = 0;
     size_t workspaceDiagnosticsProgressDone = 0;
-    uint8_t workspaceDiagnosticsProgressLastPercentage = 0;
 
 public:
     std::vector<std::string> getComments(const Luau::ModuleName& moduleName, const Luau::Location& node);

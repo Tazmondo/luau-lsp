@@ -321,6 +321,49 @@ TEST_CASE_FIXTURE(Fixture, "queue_all_workspace_diagnostics_streams_results_for_
     CHECK_EQ(diagnostics.at(second).items.size(), 0);
 }
 
+TEST_CASE_FIXTURE(Fixture, "workspace_diagnostics_progress_reports_the_file_being_checked")
+{
+    client->globalConfig.diagnostics.workspace = true;
+    client->workspaceDiagnosticsToken = "WORKSPACE-DIAGNOSTICS-PROGRESS-TOKEN";
+    client->capabilities.window = lsp::ClientWindowCapabilities{};
+    client->capabilities.window->workDoneProgress = true;
+
+    // Enough files for progress to be shown
+    std::vector<std::string> fileNames;
+    for (int i = 0; i < 20; i++)
+    {
+        fileNames.push_back("file" + std::to_string(i) + ".luau");
+        tempDir.write_child(fileNames.back(), "return {}");
+    }
+
+    workspace.queueAllWorkspaceDiagnostics();
+    workspace.processAllWorkspaceDiagnostics();
+
+    std::vector<std::string> progressMessages;
+    for (const auto& [method, params] : client->notificationQueue)
+    {
+        if (method != "$/progress" || !params)
+            continue;
+
+        auto token = params->at("token").get<std::string>();
+        const auto& value = params->at("value");
+        if (Luau::startsWith(token, "luau/workspaceDiagnostics/") && value.at("kind") == "report")
+            progressMessages.push_back(value.at("message").get<std::string>());
+    }
+
+    REQUIRE_EQ(progressMessages.size(), fileNames.size());
+    CHECK_EQ(progressMessages.front().rfind("(0/20) ", 0), 0);
+    for (const auto& fileName : fileNames)
+    {
+        auto it = std::find_if(progressMessages.begin(), progressMessages.end(),
+            [&](const std::string& message)
+            {
+                return message.size() >= fileName.size() && message.compare(message.size() - fileName.size(), fileName.size(), fileName) == 0;
+            });
+        CHECK_MESSAGE(it != progressMessages.end(), "no progress report for " << fileName);
+    }
+}
+
 TEST_CASE_FIXTURE(Fixture, "text_document_save_does_not_update_workspace_diagnostics_if_setting_is_disabled")
 {
     client->globalConfig.diagnostics.workspace = false;
