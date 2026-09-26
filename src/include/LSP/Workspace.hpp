@@ -1,5 +1,7 @@
 #pragma once
 #include <memory>
+#include <deque>
+#include <unordered_set>
 #include "Platform/LSPPlatform.hpp"
 #include "Luau/TypeCheckLimits.h"
 #include "Luau/Frontend.h"
@@ -110,6 +112,19 @@ public:
         const lsp::DocumentDiagnosticParams& params, const LSPCancellationToken& cancellationToken, bool allowUnmanagedFiles = false);
     lsp::WorkspaceDiagnosticReport workspaceDiagnostics(const lsp::WorkspaceDiagnosticParams& params);
     void recomputeDiagnostics(const ClientConfiguration& config);
+
+    /// Queues all files in the workspace to have their diagnostics computed in the background.
+    /// Results are streamed to the client as they are computed (see processNextWorkspaceDiagnostic)
+    void queueAllWorkspaceDiagnostics();
+    /// Queues the given files to have their diagnostics computed in the background
+    void queueWorkspaceDiagnostics(const std::vector<Uri>& uris);
+    /// Whether there are queued workspace diagnostics that can be computed and reported now
+    bool hasPendingWorkspaceDiagnostics() const;
+    /// Computes and reports the diagnostics of the next queued file.
+    /// If the cancellation token is triggered part way through, the file is put back at the front of the queue
+    void processNextWorkspaceDiagnostic(const LSPCancellationToken& cancellationToken);
+    /// Synchronously computes all queued workspace diagnostics
+    void processAllWorkspaceDiagnostics();
     void pushDiagnostics(const lsp::DocumentUri& uri, const size_t version);
 
     void clearDiagnosticsForFiles(const std::vector<lsp::DocumentUri>& uri) const;
@@ -136,6 +151,20 @@ private:
     lsp::WorkspaceEdit computeOrganiseRequiresEdit(const lsp::DocumentUri& uri);
     std::vector<Luau::ModuleName> findReverseDependencies(const Luau::ModuleName& moduleName);
     std::vector<Uri> findFilesForWorkspaceDiagnostics(const std::string& rootPath, const ClientConfiguration& config);
+    std::optional<lsp::WorkspaceDocumentDiagnosticReport> computeWorkspaceDocumentDiagnostics(
+        const Uri& uri, const ClientConfiguration& config, const LSPCancellationToken& cancellationToken);
+    bool canReportWorkspaceDiagnostics() const;
+    void reportWorkspaceDocumentDiagnostics(const std::vector<lsp::WorkspaceDocumentDiagnosticReport>& reports);
+    void updateWorkspaceDiagnosticsProgress(size_t newlyQueued);
+
+    /// Files waiting to have their workspace diagnostics computed in the background.
+    /// The set mirrors the queue so that a file is only ever queued once
+    std::deque<Uri> pendingWorkspaceDiagnostics{};
+    std::unordered_set<Uri, UriHash> pendingWorkspaceDiagnosticsSet{};
+    bool workspaceDiagnosticsProgressActive = false;
+    size_t workspaceDiagnosticsProgressTotal = 0;
+    size_t workspaceDiagnosticsProgressDone = 0;
+    uint8_t workspaceDiagnosticsProgressLastPercentage = 0;
 
 public:
     std::vector<std::string> getComments(const Luau::ModuleName& moduleName, const Luau::Location& node);

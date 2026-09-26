@@ -595,22 +595,71 @@ void LanguageServer::handleMessage(const json_rpc::JsonRpcMessage& msg)
     }
 }
 
+/// How long the server must go without receiving a message before it starts background work.
+/// Avoids starting (and immediately cancelling) background checks in between keystrokes
+static constexpr std::chrono::milliseconds kBackgroundWorkIdleDelay{100};
+
+WorkspaceFolderPtr LanguageServer::findWorkspaceWithPendingDiagnostics() const
+{
+    for (const auto& workspace : workspaceFolders)
+    {
+        if (workspace->hasPendingWorkspaceDiagnostics())
+            return workspace;
+    }
+    return nullptr;
+}
+
 std::optional<json_rpc::JsonRpcMessage> LanguageServer::popMessage()
 {
     std::unique_lock guard(messagesMutex);
 
-    messagesCv.wait(guard,
-        [this]
+    while (true)
+    {
+        if (shutdownRequested)
+            return std::nullopt;
+
+        if (!messages.empty())
         {
-            return !messages.empty() || shutdownRequested;
-        });
+            auto message = messages.front();
+            messages.pop();
+            messageProcessorHandledMessage = true;
+            return message;
+        }
 
-    if (shutdownRequested)
-        return std::nullopt;
+        // Nothing to handle. Use the idle time to process background work, if any
+        // Workspace state is only ever touched on this thread, so it is safe to read here
+        auto workspace = messageProcessorHandledMessage ? findWorkspaceWithPendingDiagnostics() : nullptr;
+        if (!workspace)
+        {
+            messagesCv.wait(guard);
+            continue;
+        }
 
-    auto message = messages.front();
-    messages.pop();
-    return message;
+        auto idleAt = lastMessageReceivedTime + kBackgroundWorkIdleDelay;
+        if (std::chrono::steady_clock::now() < idleAt)
+        {
+            messagesCv.wait_until(guard, idleAt);
+            continue;
+        }
+
+        // Messages are only pushed whilst holding the lock, so no message can slip in between checking the queue and
+        // setting the token: any later message will cancel this background work
+        auto cancellationToken = std::make_shared<Luau::FrontendCancellationToken>();
+        backgroundCancellationToken = cancellationToken;
+        guard.unlock();
+
+        try
+        {
+            workspace->processNextWorkspaceDiagnostic(cancellationToken);
+        }
+        catch (const std::exception& e)
+        {
+            client->sendLogMessage(lsp::MessageType::Error, std::string("failed to process background workspace diagnostics: ") + e.what());
+        }
+
+        guard.lock();
+        backgroundCancellationToken = nullptr;
+    }
 }
 
 void LanguageServer::processInputLoop()
@@ -658,6 +707,11 @@ void LanguageServer::processInputLoop()
                             continue;
                         }
                         messages.push(std::move(msg));
+
+                        // Pre-empt any background work so that this message is handled immediately
+                        lastMessageReceivedTime = std::chrono::steady_clock::now();
+                        if (backgroundCancellationToken)
+                            backgroundCancellationToken->cancel();
                     }
 
                     messagesCv.notify_one();
@@ -946,6 +1000,8 @@ void LanguageServer::shutdown()
     {
         std::unique_lock lock(messagesMutex);
         shutdownRequested = true;
+        if (backgroundCancellationToken)
+            backgroundCancellationToken->cancel();
     }
 
     messagesCv.notify_all();

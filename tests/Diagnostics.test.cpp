@@ -4,6 +4,27 @@
 
 TEST_SUITE_BEGIN("Diagnostics");
 
+/// Collects all workspace diagnostic reports streamed as progress notifications, keyed by uri. Later reports override earlier ones
+static std::unordered_map<Uri, lsp::WorkspaceDocumentDiagnosticReport, UriHash> collectStreamedWorkspaceDiagnostics(
+    const TestClient& client, const lsp::ProgressToken& token)
+{
+    std::unordered_map<Uri, lsp::WorkspaceDocumentDiagnosticReport, UriHash> reports;
+    for (const auto& [method, params] : client.notificationQueue)
+    {
+        if (method != "$/progress" || !params)
+            continue;
+
+        lsp::ProgressParams progressData = params.value();
+        if (progressData.token != token)
+            continue;
+
+        lsp::WorkspaceDiagnosticReportPartialResult partialResult = progressData.value;
+        for (const auto& report : partialResult.items)
+            reports.insert_or_assign(report.uri, report);
+    }
+    return reports;
+}
+
 TEST_CASE_FIXTURE(Fixture, "document_diagnostics_sends_information_for_required_modules")
 {
     client->capabilities.textDocument = lsp::TextDocumentClientCapabilities{};
@@ -182,26 +203,122 @@ TEST_CASE_FIXTURE(Fixture, "text_document_save_auto_updates_workspace_diagnostic
         return { hello2 = true }
     )");
     workspace.onDidSaveTextDocument(firstDocument, lsp::DidSaveTextDocumentParams{{firstDocument}});
+    workspace.processAllWorkspaceDiagnostics();
 
-    REQUIRE(!client->notificationQueue.empty());
-    auto notification = client->notificationQueue.back();
-    REQUIRE_EQ(notification.first, "$/progress");
-    REQUIRE(notification.second);
+    auto diagnostics = collectStreamedWorkspaceDiagnostics(*client, client->workspaceDiagnosticsToken.value());
+    REQUIRE_EQ(diagnostics.size(), 2);
 
-    lsp::ProgressParams progressData = notification.second.value();
-    REQUIRE_EQ(progressData.token, client->workspaceDiagnosticsToken.value());
-
-    lsp::WorkspaceDiagnosticReportPartialResult diagnostics = progressData.value;
-    REQUIRE_EQ(diagnostics.items.size(), 2);
-
-    auto mainDiagnostics = diagnostics.items[0];
-    CHECK_EQ(mainDiagnostics.uri, firstDocument);
+    auto mainDiagnostics = diagnostics.at(firstDocument);
     CHECK_EQ(mainDiagnostics.items.size(), 0);
 
-    auto dependentDiagnostics = diagnostics.items[1];
-    CHECK_EQ(dependentDiagnostics.uri, secondDocument);
-    CHECK_EQ(dependentDiagnostics.items.size(), 1);
+    auto dependentDiagnostics = diagnostics.at(secondDocument);
+    REQUIRE_EQ(dependentDiagnostics.items.size(), 1);
     CHECK_EQ(dependentDiagnostics.items[0].message, "TypeError: Key 'hello' not found in table '{ hello2: boolean }'");
+}
+
+TEST_CASE_FIXTURE(Fixture, "text_document_update_queues_workspace_diagnostics_of_dependent_files")
+{
+    client->globalConfig.diagnostics.workspace = true;
+
+    auto firstDocument = newDocument("a.luau", R"(
+        --!strict
+        return { hello = true }
+    )");
+    auto secondDocument = newDocument("b.luau", R"(
+        --!strict
+        local a = require("./a.luau")
+        print(a.hello)
+    )");
+
+    workspace.documentDiagnostics(lsp::DocumentDiagnosticParams{{firstDocument}}, nullptr);
+    workspace.documentDiagnostics(lsp::DocumentDiagnosticParams{{secondDocument}}, nullptr);
+    client->workspaceDiagnosticsToken = "WORKSPACE-DIAGNOSTICS-PROGRESS-TOKEN";
+
+    updateDocument(firstDocument, R"(
+        --!strict
+        return { hello2 = true }
+    )");
+
+    // Nothing is computed until the queue is processed
+    CHECK(workspace.hasPendingWorkspaceDiagnostics());
+    CHECK(collectStreamedWorkspaceDiagnostics(*client, client->workspaceDiagnosticsToken.value()).empty());
+
+    workspace.processAllWorkspaceDiagnostics();
+    CHECK_FALSE(workspace.hasPendingWorkspaceDiagnostics());
+
+    auto diagnostics = collectStreamedWorkspaceDiagnostics(*client, client->workspaceDiagnosticsToken.value());
+
+    // The edited file is handled by document diagnostics
+    CHECK_EQ(diagnostics.find(firstDocument), diagnostics.end());
+
+    REQUIRE_NE(diagnostics.find(secondDocument), diagnostics.end());
+    auto dependentDiagnostics = diagnostics.at(secondDocument);
+    REQUIRE_EQ(dependentDiagnostics.items.size(), 1);
+    CHECK_EQ(dependentDiagnostics.items[0].message, "TypeError: Key 'hello' not found in table '{ hello2: boolean }'");
+}
+
+TEST_CASE_FIXTURE(Fixture, "cancelled_background_workspace_diagnostics_are_requeued")
+{
+    client->globalConfig.diagnostics.workspace = true;
+    client->workspaceDiagnosticsToken = "WORKSPACE-DIAGNOSTICS-PROGRESS-TOKEN";
+
+    auto document = newDocument("a.luau", R"(
+        --!strict
+        local x: string = 1
+        return x
+    )");
+
+    workspace.queueWorkspaceDiagnostics({document});
+
+    auto cancellationToken = std::make_shared<Luau::FrontendCancellationToken>();
+    cancellationToken->cancel();
+    workspace.processNextWorkspaceDiagnostic(cancellationToken);
+
+    // Cancelled work is not reported, and is kept in the queue
+    CHECK(collectStreamedWorkspaceDiagnostics(*client, client->workspaceDiagnosticsToken.value()).empty());
+    CHECK(workspace.hasPendingWorkspaceDiagnostics());
+
+    workspace.processNextWorkspaceDiagnostic(nullptr);
+    CHECK_FALSE(workspace.hasPendingWorkspaceDiagnostics());
+
+    auto diagnostics = collectStreamedWorkspaceDiagnostics(*client, client->workspaceDiagnosticsToken.value());
+    REQUIRE_NE(diagnostics.find(document), diagnostics.end());
+    CHECK_EQ(diagnostics.at(document).items.size(), 1);
+}
+
+TEST_CASE_FIXTURE(Fixture, "queued_workspace_diagnostics_wait_for_a_pull_request")
+{
+    client->capabilities.textDocument = lsp::TextDocumentClientCapabilities{};
+    client->capabilities.textDocument->diagnostic = lsp::DiagnosticClientCapabilities{};
+    client->globalConfig.diagnostics.workspace = true;
+
+    auto document = newDocument("a.luau", "local x = 1");
+    workspace.queueWorkspaceDiagnostics({document});
+
+    // In pull mode, there is nowhere to send results until the client requests workspace diagnostics
+    CHECK_FALSE(workspace.hasPendingWorkspaceDiagnostics());
+
+    client->workspaceDiagnosticsToken = "WORKSPACE-DIAGNOSTICS-PROGRESS-TOKEN";
+    CHECK(workspace.hasPendingWorkspaceDiagnostics());
+}
+
+TEST_CASE_FIXTURE(Fixture, "queue_all_workspace_diagnostics_streams_results_for_all_files")
+{
+    client->globalConfig.diagnostics.workspace = true;
+    client->workspaceDiagnosticsToken = "WORKSPACE-DIAGNOSTICS-PROGRESS-TOKEN";
+
+    auto first = Uri::file(tempDir.write_child("first.luau", "--!strict\nlocal x: string = 1\nreturn x\n"));
+    auto second = Uri::file(tempDir.write_child("second.luau", "--!strict\nlocal y: number = 1\nreturn y\n"));
+
+    workspace.queueAllWorkspaceDiagnostics();
+    CHECK(workspace.hasPendingWorkspaceDiagnostics());
+    workspace.processAllWorkspaceDiagnostics();
+
+    auto diagnostics = collectStreamedWorkspaceDiagnostics(*client, client->workspaceDiagnosticsToken.value());
+    REQUIRE_NE(diagnostics.find(first), diagnostics.end());
+    REQUIRE_NE(diagnostics.find(second), diagnostics.end());
+    CHECK_EQ(diagnostics.at(first).items.size(), 1);
+    CHECK_EQ(diagnostics.at(second).items.size(), 0);
 }
 
 TEST_CASE_FIXTURE(Fixture, "text_document_save_does_not_update_workspace_diagnostics_if_setting_is_disabled")

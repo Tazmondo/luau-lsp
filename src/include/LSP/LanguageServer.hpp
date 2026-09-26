@@ -1,6 +1,7 @@
 #include <optional>
 #include <queue>
 #include <condition_variable>
+#include <chrono>
 
 #include "LSP/JsonRpc.hpp"
 #include "nlohmann/json.hpp"
@@ -71,6 +72,7 @@ private:
     bool allWorkspacesReceivedConfiguration() const;
     void clearCancellationToken(const json_rpc::JsonRpcMessage& msg);
     std::optional<json_rpc::JsonRpcMessage> popMessage();
+    WorkspaceFolderPtr findWorkspaceWithPendingDiagnostics() const;
 
     lsp::InitializeResult onInitialize(const lsp::InitializeParams& params);
     void onInitialized([[maybe_unused]] const lsp::InitializedParams& params);
@@ -99,4 +101,13 @@ private:
     std::queue<json_rpc::JsonRpcMessage> messages;
     Thread messageProcessorThread;
     std::unordered_map<id_type, LSPCancellationToken> cancellationTokens;
+
+    /// Background work (i.e., workspace diagnostics) is performed on the message processor thread whenever it is idle.
+    /// Any incoming message cancels the in-progress background work so that it can be handled immediately.
+    /// Guarded by messagesMutex
+    LSPCancellationToken backgroundCancellationToken = nullptr;
+    std::chrono::steady_clock::time_point lastMessageReceivedTime{};
+    /// Only accessed on the message processor thread. Background work is only looked for once the thread has handled a message,
+    /// as tests drive handleMessage directly from a different thread
+    bool messageProcessorHandledMessage = false;
 };

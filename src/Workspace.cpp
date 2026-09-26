@@ -69,7 +69,21 @@ void WorkspaceFolder::updateTextDocument(const lsp::DocumentUri& uri, const lsp:
     // In pull based diagnostics module, documentDiagnostics will update the necessary files
     // But if we are still using push-based diagnostics, we need to send updates
     auto config = client->getConfiguration(rootUri);
-    if (!usingPullDiagnostics(client->capabilities))
+    if (isWorkspaceDiagnosticsEnabled(client, config))
+    {
+        // Re-check the reverse dependencies in the background, so that errors in other files show up whilst typing
+        // The edited file itself is kept up to date through document diagnostics
+        std::vector<Uri> dependents;
+        dependents.reserve(markedDirty.size());
+        for (const auto& moduleName : markedDirty)
+        {
+            auto dirtyUri = fileResolver.getUri(moduleName);
+            if (dirtyUri != uri)
+                dependents.emplace_back(std::move(dirtyUri));
+        }
+        queueWorkspaceDiagnostics(dependents);
+    }
+    else if (!usingPullDiagnostics(client->capabilities))
     {
         // Convert the diagnostics report into a series of diagnostics published for each relevant file
         auto diagnostics = documentDiagnostics(lsp::DocumentDiagnosticParams{{uri}}, /* cancellationToken= */ nullptr);
@@ -101,47 +115,23 @@ void WorkspaceFolder::onDidSaveTextDocument(const lsp::DocumentUri& uri, const l
     auto config = client->getConfiguration(rootUri);
     if (isWorkspaceDiagnosticsEnabled(client, config))
     {
+        std::vector<Uri> files{uri};
         Luau::DenseHashSet<Luau::ModuleName> dependents{};
         frontend.traverseDependents(fileResolver.getModuleName(uri),
-            [&dependents](Luau::SourceNode& sourceNode)
+            [&](Luau::SourceNode& sourceNode)
             {
                 if (dependents.contains(sourceNode.name))
                     return false;
 
                 dependents.insert(sourceNode.name);
+                auto dependentUri = fileResolver.getUri(sourceNode.name);
+                if (dependentUri != uri)
+                    files.emplace_back(std::move(dependentUri));
                 return true;
             });
 
-        lsp::WorkspaceDiagnosticReportPartialResult report;
-
-        // Convert the diagnostics report into a series of diagnostics published for each relevant file
-        auto diagnostics = documentDiagnostics(lsp::DocumentDiagnosticParams{{uri}}, /* cancellationToken= */ nullptr);
-
-        lsp::WorkspaceDocumentDiagnosticReport mainDocumentReport;
-        mainDocumentReport.uri = uri;
-        mainDocumentReport.kind = diagnostics.kind;
-        mainDocumentReport.items = diagnostics.items;
-        mainDocumentReport.items = diagnostics.items;
-        report.items.emplace_back(mainDocumentReport);
-
-        for (auto& moduleName : dependents)
-        {
-            auto dirtyUri = fileResolver.getUri(moduleName);
-            if (dirtyUri != uri && !isIgnoredFile(dirtyUri, config))
-            {
-                auto dependencyDiags =
-                    documentDiagnostics(lsp::DocumentDiagnosticParams{{dirtyUri}}, /* cancellationToken= */ nullptr, /* allowUnmanagedFiles= */ true);
-
-                lsp::WorkspaceDocumentDiagnosticReport documentReport;
-                documentReport.uri = dirtyUri;
-                documentReport.kind = dependencyDiags.kind;
-                documentReport.items = dependencyDiags.items;
-                documentReport.items = dependencyDiags.items;
-                report.items.emplace_back(documentReport);
-            }
-        }
-
-        client->sendProgress({*client->getWorkspaceDiagnosticsToken(), report});
+        // Diagnostics are computed in the background, and streamed as they are ready
+        queueWorkspaceDiagnostics(files);
     }
 }
 
